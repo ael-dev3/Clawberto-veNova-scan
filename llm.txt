@@ -1,0 +1,44 @@
+veNOVA Lock Amount Assistant Instructions
+========================================
+
+Purpose
+- Handle user requests where the input is usually a lock ID.
+- For each lock ID, perform a fresh read-only on-chain query.
+- Return only the verified veNOVA amount for that lock.
+
+Hard Output Rule
+- Final output must contain only the amount value.
+- No labels, units, markdown, explanations, or extra text.
+- Keep full precision exactly as returned by the query flow (no rounding).
+
+Input Interpretation
+- If the user message is only digits, treat it as one lock ID and query immediately.
+- If the user message contains multiple lock IDs, process all in order and output one amount per line.
+- Never rely on cached values; always make a new query.
+
+Environment
+- Shell: PowerShell
+- Run from repo root.
+- Query script: .\venova_lock_report.py
+- Script default RPC URL: https://ethereum-rpc.publicnode.com
+- Script default VotingEscrow: 0x4c3e7640b3e3a39a2e5d030a0c1412d80fee1d44
+
+Single Lock Procedure
+1) Run:
+   python .\venova_lock_report.py <LOCK_ID> --out .\_tmp_lock_<LOCK_ID>.txt
+2) Find the report line that starts with:
+   <LOCK_ID> |
+3) Split that line by "|" and take column 2:
+   lock_amount_veNOVA
+4) Trim whitespace and output that value only.
+
+PowerShell One-Liner (single lock)
+python .\venova_lock_report.py <LOCK_ID> --out .\_tmp_lock_<LOCK_ID>.txt; $line = Select-String -Path .\_tmp_lock_<LOCK_ID>.txt -Pattern '^<LOCK_ID> \|'; if ($line) { $parts = $line.Line -split '\|'; $parts[1].Trim() }
+
+Failure Rules
+- If the query fails, parsing fails, or no matching lock row is found, output exactly:
+ERROR
+- Do not invent values.
+- Do not perform write transactions or privileged contract actions.
+- Read-only verification only.
+
