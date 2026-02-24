@@ -11,7 +11,8 @@ Run one deterministic pipeline:
 1. Parse OpenSea embedded `urql_transport` payloads for `collectionItems` and `collectionActivity`.
 2. For each listed lock, read lock state on-chain via `venova_lock_report.py` helpers.
 3. Fetch NOVA spot price from DexScreener and ETH spot from CoinGecko (with OpenSea-implied ETH fallback).
-4. Compute per-lock premium/discount versus underlying NOVA value and export JSON/CSV.
+4. Rank listings explicitly (default: `latest` by `listing_start_time`) and compute per-lock premium/discount versus underlying NOVA value.
+5. Export JSON/CSV.
 
 ## Workflow
 
@@ -30,13 +31,19 @@ python3 skills/opensea-venova-lock-arb/scripts/venova_opensea_discount_scan.py -
 python3 skills/opensea-venova-lock-arb/scripts/venova_opensea_discount_scan.py --min-nova-tokens 1 --strict-validate
 ```
 
-4. Keep default output files unless user asks otherwise:
+4. For "latest listings" answers, force explicit newest ordering:
+```bash
+python3 skills/opensea-venova-lock-arb/scripts/venova_opensea_discount_scan.py --sort-by latest
+```
+
+5. Keep default output files unless user asks otherwise:
 - `venova_opensea_discount_report.json`
 - `venova_opensea_discount_report.csv`
 
-5. Inspect required fields in output:
+6. Inspect required fields in output:
 - Listing identity: `lock_id`, `item_url`, `listing_marketplace`
 - Listing valuation: `listing_price_quote_unit`, `listing_quote_symbol`, `listing_price_usd`, `listing_price_usd_effective`
+- Listing timing/ranking: `listing_start_time`, `rank_latest`, `rank_discount`
 - On-chain lock value: `nova_inside_tokens`, `nova_inside_value_usd`
 - Relative valuation: `premium_pct_vs_spot`, `discount_pct_vs_spot`
 - Validation flags: `validation.*`
@@ -77,6 +84,7 @@ Main flags:
 - `--ve-address`
 - `--nova-token` (default: `0x00Da8466B296E382E5Da2Bf20962D0cB87200c78`)
 - `--nova-price-only` (fetch spot only)
+- `--sort-by` (`latest` default, or `discount`, `price-low`, `price-high`)
 - `--eth-price-usd` (manual ETH/USD override)
 - `--max-listings`
 - `--workers`

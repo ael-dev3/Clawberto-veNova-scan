@@ -23,6 +23,7 @@ log_out="$OUT_DIR/scan-$ts.log"
 
   cd "$REPO_DIR"
   python3 skills/opensea-venova-lock-arb/scripts/venova_opensea_discount_scan.py \
+    --sort-by latest \
     --max-listings "$MAX_LISTINGS" \
     --min-nova-tokens "$MIN_NOVA_TOKENS" \
     --workers "$WORKERS" \

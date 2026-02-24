@@ -6,6 +6,7 @@ Run an automated OpenSea lock scan every 30 minutes with strict validation.
 
 The heartbeat run:
 - retrieves OpenSea listing/activity payload data
+- ranks listings by most recent listing time
 - reads lock internals on-chain
 - fetches NOVA and ETH market prices
 - computes premium/discount with strict arithmetic checks

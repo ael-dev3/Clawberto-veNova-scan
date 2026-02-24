@@ -90,6 +90,16 @@ def parse_args() -> argparse.Namespace:
         help="Optional max number of listing rows to analyze (0 = all parsed listings).",
     )
     parser.add_argument(
+        "--sort-by",
+        default="latest",
+        choices=["latest", "discount", "price-low", "price-high"],
+        help=(
+            "Ordering of output listings array: "
+            "latest (most recently listed first), discount (largest discount first), "
+            "price-low, price-high. Default: latest."
+        ),
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=8,
@@ -151,6 +161,21 @@ def to_float(value: Any) -> Optional[float]:
     if not math.isfinite(num):
         return None
     return num
+
+
+def parse_iso8601_utc(value: Any) -> Optional[dt.datetime]:
+    s = str(value or "").strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = f"{s[:-1]}+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
 
 
 def fetch_text(url: str, timeout_sec: int = DEFAULT_TIMEOUT_SEC) -> str:
@@ -291,13 +316,14 @@ def parse_collection_listings(
                 by_lock[lock_id] = row
 
     rows = list(by_lock.values())
-    rows.sort(
-        key=lambda x: (
-            to_float(x.get("listing_price_usd")) is None,
-            to_float(x.get("listing_price_usd")) or float("inf"),
-            x.get("lock_id", 0),
-        )
-    )
+
+    def collection_latest_key(row: Dict[str, Any]):
+        start_dt = parse_iso8601_utc(row.get("listing_start_time"))
+        if start_dt is None:
+            return (1, 0.0, int(row.get("lock_id") or 0))
+        return (0, -start_dt.timestamp(), int(row.get("lock_id") or 0))
+
+    rows.sort(key=collection_latest_key)
     return rows
 
 
@@ -555,6 +581,11 @@ def enrich_listing(
 def write_csv(rows: List[Dict[str, Any]], path: str) -> None:
     headers = [
         "lock_id",
+        "listing_start_time",
+        "rank_latest",
+        "rank_discount",
+        "rank_price_low",
+        "rank_price_high",
         "listing_price_quote_unit",
         "listing_quote_symbol",
         "listing_price_usd",
@@ -600,6 +631,59 @@ def validate_arithmetic(rows: Iterable[Dict[str, Any]]) -> List[str]:
                     f"lock {lock_id}: premium reconstruction drift ({premium} vs {reconstructed})"
                 )
     return errors
+
+
+def build_rankings(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    def key_latest(row: Dict[str, Any]):
+        start_dt = parse_iso8601_utc(row.get("listing_start_time"))
+        if start_dt is None:
+            return (1, 0.0, int(row.get("lock_id") or 0))
+        return (0, -start_dt.timestamp(), int(row.get("lock_id") or 0))
+
+    def key_discount(row: Dict[str, Any]):
+        discount = to_float(row.get("discount_pct_vs_spot"))
+        start_dt = parse_iso8601_utc(row.get("listing_start_time"))
+        start_key = -start_dt.timestamp() if start_dt is not None else 0.0
+        if discount is None:
+            return (1, 0.0, 1, start_key, int(row.get("lock_id") or 0))
+        return (0, -discount, 0, start_key, int(row.get("lock_id") or 0))
+
+    def key_price_low(row: Dict[str, Any]):
+        price = to_float(row.get("listing_price_usd_effective"))
+        start_dt = parse_iso8601_utc(row.get("listing_start_time"))
+        start_key = -start_dt.timestamp() if start_dt is not None else 0.0
+        if price is None:
+            return (1, float("inf"), start_key, int(row.get("lock_id") or 0))
+        return (0, price, start_key, int(row.get("lock_id") or 0))
+
+    def key_price_high(row: Dict[str, Any]):
+        price = to_float(row.get("listing_price_usd_effective"))
+        start_dt = parse_iso8601_utc(row.get("listing_start_time"))
+        start_key = -start_dt.timestamp() if start_dt is not None else 0.0
+        if price is None:
+            return (1, 0.0, start_key, int(row.get("lock_id") or 0))
+        return (0, -price, start_key, int(row.get("lock_id") or 0))
+
+    latest = sorted(rows, key=key_latest)
+    discount = sorted(rows, key=key_discount)
+    price_low = sorted(rows, key=key_price_low)
+    price_high = sorted(rows, key=key_price_high)
+
+    for idx, row in enumerate(latest, start=1):
+        row["rank_latest"] = idx
+    for idx, row in enumerate(discount, start=1):
+        row["rank_discount"] = idx
+    for idx, row in enumerate(price_low, start=1):
+        row["rank_price_low"] = idx
+    for idx, row in enumerate(price_high, start=1):
+        row["rank_price_high"] = idx
+
+    return {
+        "latest": latest,
+        "discount": discount,
+        "price-low": price_low,
+        "price-high": price_high,
+    }
 
 
 def main() -> int:
@@ -697,15 +781,10 @@ def main() -> int:
                 except Exception as exc:
                     errors.append({"lock_id": lock_id, "error": str(exc)})
 
-        enriched.sort(
-            key=lambda x: (
-                to_float(x.get("discount_pct_vs_spot")) is None,
-                -(to_float(x.get("discount_pct_vs_spot")) or -10**12),
-            )
-        )
-
+        rankings = build_rankings(enriched)
+        output_listings = rankings[args.sort_by]
         valid_discount_rows = [
-            r for r in enriched if to_float(r.get("discount_pct_vs_spot")) is not None
+            r for r in rankings["discount"] if to_float(r.get("discount_pct_vs_spot")) is not None
         ]
         positive_discount_rows = [
             r for r in valid_discount_rows if (to_float(r.get("discount_pct_vs_spot")) or 0) > 0
@@ -715,13 +794,14 @@ def main() -> int:
             avg_premium = sum(to_float(r["premium_pct_vs_spot"]) or 0 for r in valid_discount_rows) / len(
                 valid_discount_rows
             )
-        warning_rows = [r for r in enriched if r.get("valuation_warnings")]
+        warning_rows = [r for r in output_listings if r.get("valuation_warnings")]
         listing_usd_derived_rows = [
             r
-            for r in enriched
+            for r in output_listings
             if isinstance(r.get("validation"), dict) and r["validation"].get("listing_price_usd_was_derived")
         ]
-        validation_errors = validate_arithmetic(enriched)
+        validation_errors = validate_arithmetic(output_listings)
+        latest_head = rankings["latest"][0] if rankings["latest"] else None
 
         summary = {
             "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -741,14 +821,21 @@ def main() -> int:
                 "coingecko_vs_opensea_diff_pct": eth_price_diff_pct,
             },
             "listing_rows_parsed": len(listings),
-            "listing_rows_enriched": len(enriched),
+            "listing_rows_enriched": len(output_listings),
             "listing_rows_failed": len(errors),
+            "listings_sorted_by": args.sort_by,
             "premium_rows": len(valid_discount_rows),
             "discount_rows_positive": len(positive_discount_rows),
             "rows_with_valuation_warnings": len(warning_rows),
             "rows_with_listing_usd_derived": len(listing_usd_derived_rows),
             "avg_premium_pct": avg_premium,
             "arithmetic_validation_errors": len(validation_errors),
+            "latest_listing": {
+                "lock_id": latest_head.get("lock_id") if latest_head else None,
+                "listing_start_time": latest_head.get("listing_start_time") if latest_head else None,
+                "listing_price_quote_unit": latest_head.get("listing_price_quote_unit") if latest_head else None,
+                "listing_quote_symbol": latest_head.get("listing_quote_symbol") if latest_head else None,
+            },
             "activity_rows": len(activity_rows),
             "activity_type_counts": {},
         }
@@ -762,7 +849,13 @@ def main() -> int:
 
         report = {
             "summary": summary,
-            "listings": enriched,
+            "listings": output_listings,
+            "rankings": {
+                "latest_lock_ids": [r.get("lock_id") for r in rankings["latest"]],
+                "discount_lock_ids": [r.get("lock_id") for r in rankings["discount"]],
+                "price_low_lock_ids": [r.get("lock_id") for r in rankings["price-low"]],
+                "price_high_lock_ids": [r.get("lock_id") for r in rankings["price-high"]],
+            },
             "listing_errors": errors,
             "activity": activity_rows,
             "arithmetic_validation": validation_errors,
@@ -775,7 +868,16 @@ def main() -> int:
 
         print("veNOVA OpenSea discount scan complete")
         print(f"- collection: {collection_url}")
-        print(f"- listings parsed: {len(listings)} | enriched: {len(enriched)} | failed: {len(errors)}")
+        print(
+            f"- listings parsed: {len(listings)} | enriched: {len(output_listings)} | "
+            f"failed: {len(errors)} | sorted_by: {args.sort_by}"
+        )
+        if latest_head is not None:
+            print(
+                f"- latest listing: lock #{latest_head.get('lock_id')} "
+                f"(start={latest_head.get('listing_start_time')}, "
+                f"price={latest_head.get('listing_price_quote_unit')} {latest_head.get('listing_quote_symbol')})"
+            )
         print(
             f"- NOVA spot: ${nova_price_usd:.8f} "
             f"(dex={nova_spot.get('dex_id')}, pair={nova_spot.get('pair_address')})"
