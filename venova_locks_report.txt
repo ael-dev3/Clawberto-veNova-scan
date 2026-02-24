@@ -1,0 +1,14 @@
+veNOVA Lock Report
+=================
+Generated UTC: 2026-02-24T10:42:47.531009+00:00
+RPC URL: https://ethereum-rpc.publicnode.com
+VotingEscrow: 0x4c3e7640b3e3a39a2e5d030a0c1412d80fee1d44
+Block: 24526234
+Block Timestamp UTC: 2026-02-24T10:42:35+00:00
+
+Columns:
+lock_id | lock_amount_veNOVA | permanent_principal_veNOVA | is_permanent | is_smnft | end
+
+590 | 0 | 0 | false | false | 0
+
+Total permanent principal (input locks): 0 veNOVA
