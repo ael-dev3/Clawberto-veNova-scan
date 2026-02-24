@@ -17,6 +17,7 @@ import datetime as dt
 import json
 import math
 import re
+import statistics
 import sys
 import urllib.error
 import urllib.parse
@@ -47,6 +48,7 @@ DEFAULT_COLLECTION_SLUG = "venova-652488835"
 DEFAULT_NOVA_TOKEN = "0x00Da8466B296E382E5Da2Bf20962D0cB87200c78"
 DEFAULT_TIMEOUT_SEC = 30
 USER_AGENT = "Mozilla/5.0 (compatible; OpenClaw-veNOVA-scan/1.0)"
+ETH_QUOTES = {"ETH", "WETH"}
 
 URQL_PUSH_RE = re.compile(
     r'\(window\[Symbol\.for\("urql_transport"\)\] \?\?= \[\]\)\.push\((\{.*?\})\)</script>',
@@ -108,6 +110,17 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="If >0, skip premium/discount calc for rows below this underlying NOVA amount.",
+    )
+    parser.add_argument(
+        "--eth-price-usd",
+        type=float,
+        default=None,
+        help="Optional manual ETH/USD override used when listing USD must be derived from ETH quote.",
+    )
+    parser.add_argument(
+        "--strict-validate",
+        action="store_true",
+        help="Fail the run if arithmetic consistency checks detect calculation drift.",
     )
     parser.add_argument(
         "--out-json",
@@ -388,6 +401,47 @@ def fetch_nova_spot(token_address: str) -> Dict[str, Any]:
     }
 
 
+def fetch_eth_spot_usd() -> Dict[str, Any]:
+    payload = fetch_json("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd")
+    eth = payload.get("ethereum")
+    eth = eth if isinstance(eth, dict) else {}
+    price_usd = to_float(eth.get("usd"))
+    if price_usd is None or price_usd <= 0:
+        raise RuntimeError("CoinGecko ETH price missing or invalid.")
+    return {
+        "source": "coingecko",
+        "price_usd": price_usd,
+        "fetched_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+
+
+def derive_eth_usd_from_listings(rows: Iterable[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    implied = []
+    for row in rows:
+        quote_symbol = str(row.get("listing_quote_symbol") or "").upper()
+        if quote_symbol not in ETH_QUOTES:
+            continue
+        quote_unit = to_float(row.get("listing_price_quote_unit"))
+        usd = to_float(row.get("listing_price_usd"))
+        if quote_unit is None or quote_unit <= 0 or usd is None or usd <= 0:
+            continue
+        implied.append(usd / quote_unit)
+    if not implied:
+        return None
+    return {
+        "source": "opensea_implied",
+        "price_usd": statistics.median(implied),
+        "sample_count": len(implied),
+        "fetched_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+
+
+def relative_diff_pct(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    if a is None or b is None or a <= 0 or b <= 0:
+        return None
+    return abs(a - b) / b * 100.0
+
+
 def compute_nova_inside_wei(lock: Dict[str, Any]) -> int:
     amount_wei = int(lock.get("amount_wei") or 0)
     principal_wei = int(lock.get("principal_wei") or 0)
@@ -405,6 +459,7 @@ def enrich_listing(
     rpc_url: str,
     ve_address: str,
     nova_spot_usd: float,
+    eth_spot_usd: Optional[float],
     min_nova_tokens_for_valuation: float,
 ) -> Dict[str, Any]:
     lock_id = int(listing_row["lock_id"])
@@ -413,7 +468,10 @@ def enrich_listing(
     nova_inside_tokens = nova_inside_wei / DECIMALS
     nova_inside_value_usd = nova_inside_tokens * nova_spot_usd if nova_inside_tokens > 0 else None
 
+    listing_quote_symbol = str(listing_row.get("listing_quote_symbol") or "").upper()
+    listing_quote_unit = to_float(listing_row.get("listing_price_quote_unit"))
     listing_usd = to_float(listing_row.get("listing_price_usd"))
+    listing_usd_effective = listing_usd
     premium_pct = None
     discount_pct = None
     implied_nova_unit_usd = None
@@ -424,24 +482,40 @@ def enrich_listing(
         valuation_warnings.append("UNDERLYING_BELOW_MIN_THRESHOLD")
 
     if (
-        listing_usd is not None
-        and listing_usd > 0
+        (listing_usd_effective is None or listing_usd_effective <= 0)
+        and listing_quote_symbol in ETH_QUOTES
+        and listing_quote_unit is not None
+        and listing_quote_unit > 0
+        and eth_spot_usd is not None
+        and eth_spot_usd > 0
+    ):
+        listing_usd_effective = listing_quote_unit * eth_spot_usd
+        valuation_warnings.append("LISTING_USD_DERIVED_FROM_ETH_SPOT")
+
+    has_blocking_warning = any(
+        w in {"NO_UNDERLYING_NOVA", "UNDERLYING_BELOW_MIN_THRESHOLD", "MISSING_LISTING_USD"}
+        for w in valuation_warnings
+    )
+
+    if (
+        listing_usd_effective is not None
+        and listing_usd_effective > 0
         and nova_inside_value_usd is not None
         and nova_inside_value_usd > 0
-        and not valuation_warnings
+        and not has_blocking_warning
     ):
-        premium_pct = ((listing_usd / nova_inside_value_usd) - 1.0) * 100.0
+        premium_pct = ((listing_usd_effective / nova_inside_value_usd) - 1.0) * 100.0
         discount_pct = -premium_pct
-        implied_nova_unit_usd = listing_usd / nova_inside_tokens
-    elif listing_usd is None or listing_usd <= 0:
+        implied_nova_unit_usd = listing_usd_effective / nova_inside_tokens
+    elif listing_usd_effective is None or listing_usd_effective <= 0:
         valuation_warnings.append("MISSING_LISTING_USD")
 
     if (
-        listing_row.get("listing_quote_symbol") in ("ETH", "WETH")
-        and to_float(listing_row.get("listing_price_quote_unit")) is not None
+        listing_quote_symbol in ETH_QUOTES
+        and listing_quote_unit is not None
         and nova_inside_tokens > 0
     ):
-        implied_nova_unit_quote = to_float(listing_row.get("listing_price_quote_unit")) / nova_inside_tokens
+        implied_nova_unit_quote = listing_quote_unit / nova_inside_tokens
     else:
         implied_nova_unit_quote = None
 
@@ -456,6 +530,7 @@ def enrich_listing(
             "lock_is_permanent": lock.get("is_permanent"),
             "lock_is_smnft": lock.get("is_smnft"),
             "valuation_basis": "smnft_principal" if lock.get("is_smnft") else "locked_amount",
+            "listing_price_usd_effective": listing_usd_effective,
             "nova_inside_wei": nova_inside_wei,
             "nova_inside_tokens": nova_inside_tokens,
             "nova_inside_value_usd": nova_inside_value_usd,
@@ -465,7 +540,10 @@ def enrich_listing(
             "discount_pct_vs_spot": discount_pct,
             "valuation_warnings": valuation_warnings,
             "validation": {
-                "has_listing_price_usd": listing_usd is not None and listing_usd > 0,
+                "has_listing_price_usd": listing_usd_effective is not None and listing_usd_effective > 0,
+                "listing_price_usd_was_derived": (
+                    "LISTING_USD_DERIVED_FROM_ETH_SPOT" in valuation_warnings
+                ),
                 "has_nova_inside": nova_inside_tokens > 0,
                 "item_name_matches_lock_id": listing_row.get("name_lock_id_match"),
             },
@@ -480,12 +558,15 @@ def write_csv(rows: List[Dict[str, Any]], path: str) -> None:
         "listing_price_quote_unit",
         "listing_quote_symbol",
         "listing_price_usd",
+        "listing_price_usd_effective",
         "nova_inside_tokens",
         "nova_inside_value_usd",
         "implied_nova_unit_quote",
         "implied_nova_unit_usd",
         "premium_pct_vs_spot",
         "discount_pct_vs_spot",
+        "valuation_basis",
+        "valuation_warnings",
         "listing_marketplace",
         "listing_maker",
         "listing_end_time",
@@ -498,6 +579,29 @@ def write_csv(rows: List[Dict[str, Any]], path: str) -> None:
             writer.writerow({k: row.get(k) for k in headers})
 
 
+def validate_arithmetic(rows: Iterable[Dict[str, Any]]) -> List[str]:
+    errors: List[str] = []
+    for row in rows:
+        lock_id = row.get("lock_id")
+        premium = to_float(row.get("premium_pct_vs_spot"))
+        discount = to_float(row.get("discount_pct_vs_spot"))
+        if premium is not None and discount is not None:
+            if abs((premium + discount)) > 1e-9:
+                errors.append(
+                    f"lock {lock_id}: premium/discount mismatch ({premium} + {discount} != 0)"
+                )
+
+        listing_usd = to_float(row.get("listing_price_usd_effective"))
+        underlying_usd = to_float(row.get("nova_inside_value_usd"))
+        if premium is not None and listing_usd is not None and underlying_usd is not None and underlying_usd > 0:
+            reconstructed = (listing_usd / underlying_usd - 1.0) * 100.0
+            if abs(reconstructed - premium) > 1e-7:
+                errors.append(
+                    f"lock {lock_id}: premium reconstruction drift ({premium} vs {reconstructed})"
+                )
+    return errors
+
+
 def main() -> int:
     args = parse_args()
     collection_url = f"https://opensea.io/collection/{args.collection_slug}"
@@ -505,9 +609,7 @@ def main() -> int:
 
     try:
         nova_spot = fetch_nova_spot(args.nova_token)
-        if args.nova_price_only:
-            print(json.dumps(nova_spot, indent=2))
-            return 0
+        nova_price_usd = float(nova_spot["price_usd"])
 
         collection_html = fetch_text(collection_url)
         collection_payloads = extract_urql_payloads(collection_html)
@@ -517,13 +619,59 @@ def main() -> int:
         if args.max_listings > 0:
             listings = listings[: args.max_listings]
 
+        implied_eth = derive_eth_usd_from_listings(listings)
+        coingecko_eth = None
+        coingecko_eth_error = None
+        try:
+            coingecko_eth = fetch_eth_spot_usd()
+        except Exception as exc:
+            coingecko_eth_error = str(exc)
+
+        eth_override = to_float(args.eth_price_usd)
+        if eth_override is not None and eth_override <= 0:
+            raise RuntimeError(f"Invalid --eth-price-usd value: {args.eth_price_usd}")
+
+        eth_spot_usd = None
+        eth_price_source = "unavailable"
+        if eth_override is not None:
+            eth_spot_usd = eth_override
+            eth_price_source = "manual_override"
+        elif coingecko_eth is not None:
+            eth_spot_usd = to_float(coingecko_eth.get("price_usd"))
+            eth_price_source = "coingecko"
+        elif implied_eth is not None:
+            eth_spot_usd = to_float(implied_eth.get("price_usd"))
+            eth_price_source = "opensea_implied"
+
+        eth_price_diff_pct = relative_diff_pct(
+            to_float(coingecko_eth.get("price_usd")) if coingecko_eth else None,
+            to_float(implied_eth.get("price_usd")) if implied_eth else None,
+        )
+
+        if args.nova_price_only:
+            print(
+                json.dumps(
+                    {
+                        "nova_spot": nova_spot,
+                        "eth_spot_used": {
+                            "source": eth_price_source,
+                            "price_usd": eth_spot_usd,
+                            "coingecko_error": coingecko_eth_error,
+                            "coingecko": coingecko_eth,
+                            "opensea_implied": implied_eth,
+                            "coingecko_vs_opensea_diff_pct": eth_price_diff_pct,
+                        },
+                    },
+                    indent=2,
+                )
+            )
+            return 0
+
         activity_rows: List[Dict[str, Any]] = []
         if not args.skip_activity:
             activity_html = fetch_text(activity_url)
             activity_payloads = extract_urql_payloads(activity_html)
             activity_rows = parse_collection_activity(activity_payloads)
-
-        nova_price_usd = float(nova_spot["price_usd"])
 
         workers = max(1, int(args.workers))
         enriched: List[Dict[str, Any]] = []
@@ -537,6 +685,7 @@ def main() -> int:
                     rpc_url=args.rpc_url,
                     ve_address=args.ve_address,
                     nova_spot_usd=nova_price_usd,
+                    eth_spot_usd=eth_spot_usd,
                     min_nova_tokens_for_valuation=max(0.0, float(args.min_nova_tokens)),
                 ): row["lock_id"]
                 for row in listings
@@ -567,6 +716,12 @@ def main() -> int:
                 valid_discount_rows
             )
         warning_rows = [r for r in enriched if r.get("valuation_warnings")]
+        listing_usd_derived_rows = [
+            r
+            for r in enriched
+            if isinstance(r.get("validation"), dict) and r["validation"].get("listing_price_usd_was_derived")
+        ]
+        validation_errors = validate_arithmetic(enriched)
 
         summary = {
             "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -577,13 +732,23 @@ def main() -> int:
             "ve_address": args.ve_address,
             "nova_token": args.nova_token,
             "nova_spot": nova_spot,
+            "eth_spot_used": {
+                "source": eth_price_source,
+                "price_usd": eth_spot_usd,
+                "coingecko": coingecko_eth,
+                "opensea_implied": implied_eth,
+                "coingecko_error": coingecko_eth_error,
+                "coingecko_vs_opensea_diff_pct": eth_price_diff_pct,
+            },
             "listing_rows_parsed": len(listings),
             "listing_rows_enriched": len(enriched),
             "listing_rows_failed": len(errors),
             "premium_rows": len(valid_discount_rows),
             "discount_rows_positive": len(positive_discount_rows),
             "rows_with_valuation_warnings": len(warning_rows),
+            "rows_with_listing_usd_derived": len(listing_usd_derived_rows),
             "avg_premium_pct": avg_premium,
+            "arithmetic_validation_errors": len(validation_errors),
             "activity_rows": len(activity_rows),
             "activity_type_counts": {},
         }
@@ -600,6 +765,7 @@ def main() -> int:
             "listings": enriched,
             "listing_errors": errors,
             "activity": activity_rows,
+            "arithmetic_validation": validation_errors,
         }
 
         with open(args.out_json, "w", encoding="utf-8") as f:
@@ -614,18 +780,33 @@ def main() -> int:
             f"- NOVA spot: ${nova_price_usd:.8f} "
             f"(dex={nova_spot.get('dex_id')}, pair={nova_spot.get('pair_address')})"
         )
+        print(
+            f"- ETH spot used: {('n/a' if eth_spot_usd is None else f'${eth_spot_usd:.8f}')} "
+            f"(source={eth_price_source})"
+        )
+        if eth_price_diff_pct is not None:
+            print(f"- ETH price cross-check (CoinGecko vs OpenSea implied): {eth_price_diff_pct:.4f}%")
+        if coingecko_eth_error:
+            print(f"- ETH external source warning: {coingecko_eth_error}")
         if positive_discount_rows:
             best = positive_discount_rows[0]
             print(
                 f"- best discount row: lock #{best.get('lock_id')} "
                 f"{best.get('discount_pct_vs_spot'):.2f}% "
-                f"(listing ${best.get('listing_price_usd'):.6f}, underlying ${best.get('nova_inside_value_usd'):.6f})"
+                f"(listing ${best.get('listing_price_usd_effective'):.6f}, underlying ${best.get('nova_inside_value_usd'):.6f})"
             )
         elif valid_discount_rows:
             best = valid_discount_rows[0]
             print(
                 f"- best available row (no positive discounts): lock #{best.get('lock_id')} "
                 f"{best.get('discount_pct_vs_spot'):.2f}%"
+            )
+        print(f"- rows using derived listing USD: {len(listing_usd_derived_rows)}")
+        print(f"- arithmetic validation errors: {len(validation_errors)}")
+        if args.strict_validate and validation_errors:
+            raise RuntimeError(
+                f"Strict validation failed with {len(validation_errors)} arithmetic errors. "
+                f"See arithmetic_validation in {args.out_json}."
             )
         print(f"- json: {args.out_json}")
         print(f"- csv: {args.out_csv}")
