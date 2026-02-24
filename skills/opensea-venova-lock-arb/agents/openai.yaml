@@ -1,0 +1,4 @@
+interface:
+  display_name: "veNOVA OpenSea Arb"
+  short_description: "Scan veNOVA listings and compute NOVA premium or discount."
+  default_prompt: "Analyze veNOVA OpenSea lock listings against underlying NOVA spot value and output discount/premium opportunities with validation checks."

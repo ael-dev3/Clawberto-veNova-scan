@@ -164,8 +164,8 @@ def render_report(
     block_ts: int,
     locks: List[dict],
 ) -> str:
-    now_utc = dt.datetime.now(dt.UTC).isoformat()
-    block_utc = dt.datetime.fromtimestamp(block_ts, dt.UTC).isoformat()
+    now_utc = dt.datetime.now(dt.timezone.utc).isoformat()
+    block_utc = dt.datetime.fromtimestamp(block_ts, dt.timezone.utc).isoformat()
 
     lines = [
         "veNOVA Lock Report",
