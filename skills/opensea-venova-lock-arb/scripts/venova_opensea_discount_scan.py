@@ -35,9 +35,11 @@ if str(REPO_ROOT) not in sys.path:
 
 try:
     from venova_lock_report import (  # type: ignore[import]
+        BlockContext,
         DECIMALS,
         DEFAULT_RPC_URL,
         DEFAULT_VE_ADDRESS,
+        get_block_context,
         query_lock,
     )
 except Exception as exc:
@@ -882,21 +884,32 @@ def fetch_locks_by_id(
     rpc_url: str,
     ve_address: str,
     workers: int,
-) -> Tuple[Dict[int, Dict[str, Any]], List[Dict[str, Any]]]:
+) -> Tuple[Dict[int, Dict[str, Any]], List[Dict[str, Any]], Optional[BlockContext]]:
     unique_ids = sorted({int(x) for x in lock_ids if int(x) >= 0})
     if not unique_ids:
-        return {}, []
+        return {}, [], None
+
+    snapshot = get_block_context(rpc_url)
     lock_map: Dict[int, Dict[str, Any]] = {}
     errors: List[Dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=min(max(1, workers), len(unique_ids))) as pool:
-        futures = {pool.submit(query_lock, rpc_url, ve_address, lock_id): lock_id for lock_id in unique_ids}
+        futures = {
+            pool.submit(
+                query_lock,
+                rpc_url,
+                ve_address,
+                lock_id,
+                block_tag=snapshot.hex_number,
+            ): lock_id
+            for lock_id in unique_ids
+        }
         for fut in as_completed(futures):
             lock_id = futures[fut]
             try:
                 lock_map[lock_id] = fut.result()
             except Exception as exc:
                 errors.append({"lock_id": lock_id, "error": str(exc)})
-    return lock_map, errors
+    return lock_map, errors, snapshot
 
 
 def write_csv(rows: List[Dict[str, Any]], path: str) -> None:
@@ -1151,7 +1164,7 @@ def main() -> int:
         workers = max(1, int(args.workers))
         enriched: List[Dict[str, Any]] = []
         errors: List[Dict[str, Any]] = []
-        lock_map, lock_errors = fetch_locks_by_id(
+        lock_map, lock_errors, lock_snapshot = fetch_locks_by_id(
             [int(row["lock_id"]) for row in listings if parse_numeric_string(row.get("lock_id")) is not None],
             rpc_url=args.rpc_url,
             ve_address=args.ve_address,
@@ -1234,6 +1247,18 @@ def main() -> int:
             "activity_url": activity_url,
             "rpc_url": args.rpc_url,
             "ve_address": args.ve_address,
+            "lock_snapshot": (
+                {
+                    "block_number": lock_snapshot.number,
+                    "block_hex": lock_snapshot.hex_number,
+                    "block_timestamp_utc": dt.datetime.fromtimestamp(
+                        lock_snapshot.timestamp,
+                        dt.timezone.utc,
+                    ).isoformat(),
+                }
+                if lock_snapshot is not None
+                else None
+            ),
             "ve_exchange": {
                 "enabled": not args.skip_ve_exchange,
                 "api_base": args.ve_exchange_api_base,
@@ -1319,6 +1344,11 @@ def main() -> int:
             f"- listings considered: {len(listings)} | enriched: {len(output_listings)} | "
             f"failed: {len(errors)} | sorted_by: {args.sort_by}"
         )
+        if lock_snapshot is not None:
+            print(
+                f"- lock snapshot: block {lock_snapshot.number} "
+                f"({dt.datetime.fromtimestamp(lock_snapshot.timestamp, dt.timezone.utc).isoformat()})"
+            )
         if latest_head is not None:
             print(
                 f"- latest listing: lock #{latest_head.get('lock_id')} "

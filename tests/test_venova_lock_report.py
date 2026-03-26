@@ -47,6 +47,71 @@ class ValidationTests(unittest.TestCase):
             report.normalize_address("not-an-address")
 
 
+class QueryLockTests(unittest.TestCase):
+    def test_query_lock_uses_explicit_block_tag_and_normalizes_address(self) -> None:
+        fake_row = report.LockReportRow(
+            lock_id=7,
+            amount_wei=2 * report.DECIMALS,
+            principal_wei=report.DECIMALS,
+            is_permanent=True,
+            is_smnft=False,
+            end=123,
+        )
+
+        with patch.object(report, "query_locks", return_value=[fake_row]) as mock_query_locks:
+            row = report.query_lock(
+                "https://example-rpc.invalid",
+                "0x4C3E7640B3E3A39A2E5D030A0C1412D80FEE1D44",
+                7,
+                block_tag="0xabc",
+            )
+
+        mock_query_locks.assert_called_once_with(
+            "https://example-rpc.invalid",
+            report.DEFAULT_VE_ADDRESS,
+            [7],
+            "0xabc",
+            report.DEFAULT_BATCH_SIZE,
+        )
+        self.assertEqual(
+            row,
+            {
+                "lock_id": 7,
+                "amount_wei": 2 * report.DECIMALS,
+                "amount_tokens": "2",
+                "end": 123,
+                "is_permanent": True,
+                "is_smnft": False,
+                "principal_wei": report.DECIMALS,
+                "principal_tokens": "1",
+            },
+        )
+
+    def test_query_lock_uses_latest_snapshot_when_block_tag_is_missing(self) -> None:
+        fake_row = report.LockReportRow(
+            lock_id=9,
+            amount_wei=report.DECIMALS,
+            principal_wei=0,
+            is_permanent=False,
+            is_smnft=False,
+            end=999,
+        )
+
+        with patch.object(
+            report,
+            "get_block_context",
+            return_value=report.BlockContext(number=123, hex_number="0xdeadbeef", timestamp=1_700_000_000),
+        ), patch.object(report, "query_locks", return_value=[fake_row]) as mock_query_locks:
+            row = report.query_lock(
+                "https://example-rpc.invalid",
+                report.DEFAULT_VE_ADDRESS,
+                9,
+            )
+
+        self.assertEqual(row["lock_id"], 9)
+        self.assertEqual(mock_query_locks.call_args.args[3], "0xdeadbeef")
+
+
 class QueryLocksTests(unittest.TestCase):
     def test_pins_every_eth_call_to_the_snapshot_block(self) -> None:
         seen_payloads: list[list[dict[str, object]]] = []

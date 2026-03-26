@@ -60,6 +60,18 @@ class LockReportRow:
     def principal_tokens(self) -> str:
         return wei_to_token_str(self.principal_wei)
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "lock_id": self.lock_id,
+            "amount_wei": self.amount_wei,
+            "amount_tokens": self.amount_tokens,
+            "end": self.end,
+            "is_permanent": self.is_permanent,
+            "is_smnft": self.is_smnft,
+            "principal_wei": self.principal_wei,
+            "principal_tokens": self.principal_tokens,
+        }
+
 
 def positive_int(value: str) -> int:
     parsed = int(value)
@@ -342,6 +354,29 @@ def query_locks(
     if len(finalized_rows) != len(lock_ids):
         raise RuntimeError("Failed to populate all lock rows.")
     return finalized_rows
+
+
+def query_lock(
+    rpc_url: str,
+    ve_address: str,
+    lock_id: int,
+    *,
+    block_tag: str | None = None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+) -> dict[str, Any]:
+    if lock_id < 0:
+        raise ValueError(f"Lock id must be non-negative: {lock_id}")
+
+    normalized_address = normalize_address(ve_address)
+    resolved_block_tag = block_tag or get_block_context(rpc_url).hex_number
+    row = query_locks(
+        rpc_url,
+        normalized_address,
+        [lock_id],
+        resolved_block_tag,
+        batch_size,
+    )[0]
+    return row.to_dict()
 
 
 def render_report(
